@@ -194,7 +194,31 @@ func (s *S3Backup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ig
 	}
 	return ad, nil
 }
+func (s *S3Backup) Restore(ctx context.Context, r io.Reader, callback RestoreCallback) error {
+	reader := r
 
+	// Respect write limit config (MB/s)
+	if writeLimit := int64(config.Get().System.Backups.WriteLimit * 1024 * 1024); writeLimit > 0 {
+		s.log().WithField("write_limit", writeLimit).Info("rate limiting restore")
+		reader = ratelimit.Reader(r, ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit))
+	}
+
+	// Extract the tar.gz stream and invoke callback per file
+	if err := format.Extract(ctx, reader, func(ctx context.Context, f archives.FileInfo) error {
+		fileReader, err := f.Open()
+		if err != nil {
+			s.log().WithField("name", f.NameInArchive).WithError(err).Error("failed to open archive file entry")
+			return err
+		}
+		defer fileReader.Close()
+
+		return callback(f.NameInArchive, f.FileInfo, fileReader)
+	}); err != nil {
+		s.log().WithError(err).Error("restore failed during extraction")
+		return err
+	}
+	return nil
+}
 // Optimized version: concurrent multipart uploads, upload speed logging
 func (s *S3Backup) optimizedStreamToS3WithRetry(ctx context.Context, pr io.Reader, size int64, urls *remote.BackupRemoteUploadURLs, uploadThreads int) ([]remote.BackupPart, error) {
 	type uploadTask struct {
