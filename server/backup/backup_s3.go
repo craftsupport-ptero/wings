@@ -18,7 +18,7 @@ import (
 	"github.com/cenkalti/backoff/v4"
 	"github.com/juju/ratelimit"
 	"github.com/mholt/archives"
-        "github.com/mholt/archiver/v4"
+
 	"github.com/pterodactyl/wings/config"
 	"github.com/pterodactyl/wings/remote"
 	"github.com/pterodactyl/wings/server/filesystem"
@@ -30,15 +30,12 @@ type S3Backup struct {
 
 var _ BackupInterface = (*S3Backup)(nil)
 
-// ------------ CONFIGURATION -------------
-// Set these via config or directly as needed.
+// Tune these as needed, or make them configurable!
 var (
-	DefaultTarThreads    = 6 // Set via config if desired
-	DefaultUploadThreads = 64 // Set via config if desired
-	SpeedLogInterval     = 5 * time.Second // Log upload speed every 5 seconds
+	DefaultTarThreads    = 6
+	DefaultUploadThreads = 32
+	SpeedLogInterval     = 5 * time.Second
 )
-
-// ------------ END CONFIGURATION ----------
 
 func NewS3(client remote.Client, uuid string, ignore string) *S3Backup {
 	return &S3Backup{
@@ -51,75 +48,37 @@ func NewS3(client remote.Client, uuid string, ignore string) *S3Backup {
 	}
 }
 
+// Remove removes a backup from the system.
 func (s *S3Backup) Remove() error {
 	return os.Remove(s.Path())
 }
 
+// WithLogContext attaches additional context to the log output for this backup.
 func (s *S3Backup) WithLogContext(c map[string]interface{}) {
 	s.logContext = c
 }
 
-// Streaming tar.gz archiver with configurable concurrency.
-// Walks the filesystem and writes to w as a tar.gz stream.
+// Streaming tar.gz archiver (run in a goroutine, writes to w)
 func (s *S3Backup) streamTarGz(ctx context.Context, fsys *filesystem.Filesystem, ignore string, w io.Writer, tarThreads int) error {
 	gz := gzip.NewWriter(w)
 	defer gz.Close()
 	tw := tar.NewWriter(gz)
 	defer tw.Close()
 
-	// Worker pool to copy file data concurrently
-	type fileJob struct {
-		Header *tar.Header
-		Path   string
-	}
+	rootPath := fsys.Path()
 
-	jobs := make(chan fileJob, tarThreads*2)
-	errs := make(chan error, tarThreads)
-	var wg sync.WaitGroup
+	// For simplicity, do NOT parallelize tar writing, as tar.Writer is not thread-safe.
+	// If you want *aggressive* parallelism, it must be done by building the tar stream in order (hard).
 
-	for i := 0; i < tarThreads; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for job := range jobs {
-				if err := tw.WriteHeader(job.Header); err != nil {
-					errs <- err
-					return
-				}
-				// Only copy file data for regular files
-				if job.Header.Typeflag == tar.TypeReg {
-					f, err := os.Open(job.Path)
-					if err != nil {
-						errs <- err
-						return
-					}
-					_, err = io.Copy(tw, f)
-					f.Close()
-					if err != nil {
-						errs <- err
-						return
-					}
-				}
-			}
-		}()
-	}
-
-	sendErr := func(err error) bool {
-		select {
-		case errs <- err:
-			return true
-		default:
-			return false
-		}
-	}
-
-	walkErr := fsys.WalkFiles(ctx, func(path string, info os.FileInfo, _ error) error {
-		relPath, err := filepath.Rel(fsys.BasePath(), path)
+	err := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		// Ignore files as per configured ignore rules
-		if filesystem.ShouldIgnore(relPath, ignore) {
+		relPath, err := filepath.Rel(rootPath, path)
+		if err != nil {
+			return err
+		}
+		if ignore != "" && relPath == ignore {
 			return nil
 		}
 		hdr, err := tar.FileInfoHeader(info, "")
@@ -127,44 +86,36 @@ func (s *S3Backup) streamTarGz(ctx context.Context, fsys *filesystem.Filesystem,
 			return err
 		}
 		hdr.Name = relPath
-		select {
-		case jobs <- fileJob{Header: hdr, Path: path}:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	})
-	close(jobs)
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		if err != nil {
+		if err := tw.WriteHeader(hdr); err != nil {
 			return err
 		}
-	}
-	return walkErr
+		if info.Mode().IsRegular() {
+			f, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			_, err = io.Copy(tw, f)
+			f.Close()
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return err
 }
 
+// Generate creates a streaming backup and uploads it to S3 in parallel parts.
 func (s *S3Backup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ignore string) (*ArchiveDetails, error) {
 	defer s.Remove()
 
 	s.log().WithField("path", s.Path()).Info("starting streaming backup for server")
 
-	// Estimate size for S3 part planning (optional, can be 0 if unknown)
-	size, err := fsys.EstimateArchiveSize(ctx, ignore)
-	if err != nil {
-		return nil, err
-	}
+	// No reliable way to know size beforehand; use 0 for "unknown".
+	size := int64(0)
 
-	// Use config or default for threads
-	tarThreads := config.Get().System.Backups.TarThreads
-	if tarThreads <= 0 {
-		tarThreads = DefaultTarThreads
-	}
-	uploadThreads := config.Get().System.Backups.UploadThreads
-	if uploadThreads <= 0 {
-		uploadThreads = DefaultUploadThreads
-	}
+	tarThreads := DefaultTarThreads
+	uploadThreads := DefaultUploadThreads
 
 	pr, pw := io.Pipe()
 	go func() {
@@ -194,17 +145,16 @@ func (s *S3Backup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ig
 	}
 	return ad, nil
 }
+
 func (s *S3Backup) Restore(ctx context.Context, r io.Reader, callback RestoreCallback) error {
 	reader := r
-
 	// Respect write limit config (MB/s)
 	if writeLimit := int64(config.Get().System.Backups.WriteLimit * 1024 * 1024); writeLimit > 0 {
 		s.log().WithField("write_limit", writeLimit).Info("rate limiting restore")
 		reader = ratelimit.Reader(r, ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit))
 	}
-
-	// Extract the tar.gz stream and invoke callback per file
-	if err := format.Extract(ctx, reader, func(ctx context.Context, f archives.FileInfo) error {
+	// Updated: pass nil for the []string param, see your format.Extract docs.
+	if err := format.Extract(ctx, reader, nil, func(ctx context.Context, f archives.FileInfo) error {
 		fileReader, err := f.Open()
 		if err != nil {
 			s.log().WithField("name", f.NameInArchive).WithError(err).Error("failed to open archive file entry")
@@ -219,7 +169,9 @@ func (s *S3Backup) Restore(ctx context.Context, r io.Reader, callback RestoreCal
 	}
 	return nil
 }
-// Optimized version: concurrent multipart uploads, upload speed logging
+
+// Multi-threaded, speed-logged, retrying S3 multipart upload.
+// Reads from pr, splits into parts, uploads in parallel.
 func (s *S3Backup) optimizedStreamToS3WithRetry(ctx context.Context, pr io.Reader, size int64, urls *remote.BackupRemoteUploadURLs, uploadThreads int) ([]remote.BackupPart, error) {
 	type uploadTask struct {
 		Index int
@@ -233,8 +185,6 @@ func (s *S3Backup) optimizedStreamToS3WithRetry(ctx context.Context, pr io.Reade
 		Err   error
 	}
 
-	// Split into parts and buffer them in memory
-	s.log().Info("splitting archive into parts for multipart upload")
 	partCount := len(urls.Parts)
 	partSize := urls.PartSize
 	partsData := make([][]byte, partCount)
@@ -242,7 +192,8 @@ func (s *S3Backup) optimizedStreamToS3WithRetry(ctx context.Context, pr io.Reade
 
 	for i := 0; i < partCount; i++ {
 		thisPartSize := partSize
-		if i+1 == partCount {
+		// For last part, read what's left (if known, else just try to fill)
+		if i+1 == partCount && size > 0 {
 			thisPartSize = size - int64(i)*partSize
 		}
 		buf := make([]byte, thisPartSize)
@@ -259,12 +210,10 @@ func (s *S3Backup) optimizedStreamToS3WithRetry(ctx context.Context, pr io.Reade
 
 	s.log().WithField("read", totalRead).Info("finished buffering all parts, beginning upload")
 
-	// Upload with concurrent workers
 	tasks := make(chan uploadTask, partCount)
 	results := make(chan uploadResult, partCount)
 	var uploadedBytes int64
 
-	// Upload worker goroutine
 	uploadWorker := func() {
 		for task := range tasks {
 			s.log().WithField("part_id", task.Index+1).WithField("size", task.Size).Info("uploading backup part")
@@ -274,7 +223,6 @@ func (s *S3Backup) optimizedStreamToS3WithRetry(ctx context.Context, pr io.Reade
 		}
 	}
 
-	// Start upload workers
 	for i := 0; i < uploadThreads; i++ {
 		go uploadWorker()
 	}
@@ -295,11 +243,11 @@ func (s *S3Backup) optimizedStreamToS3WithRetry(ctx context.Context, pr io.Reade
 				elapsed := time.Since(start).Seconds()
 				avgSpeed := float64(curBytes) / elapsed
 				intervalSpeed := float64(curBytes-lastBytes) / SpeedLogInterval.Seconds()
-				s.log().WithFields(map[string]interface{}{
-					"uploaded":      curBytes,
-					"average_speed": fmt.Sprintf("%.2f MB/s", avgSpeed/1024/1024),
-					"interval_speed": fmt.Sprintf("%.2f MB/s", intervalSpeed/1024/1024),
-				}).Info("upload speed stats")
+				s.log().
+					WithField("uploaded", curBytes).
+					WithField("average_speed", fmt.Sprintf("%.2f MB/s", avgSpeed/1024/1024)).
+					WithField("interval_speed", fmt.Sprintf("%.2f MB/s", intervalSpeed/1024/1024)).
+					Info("upload speed stats")
 				lastBytes = curBytes
 			}
 		}
@@ -317,7 +265,6 @@ func (s *S3Backup) optimizedStreamToS3WithRetry(ctx context.Context, pr io.Reade
 	}
 	close(tasks)
 
-	// Collect results
 	uploadedParts := make([]remote.BackupPart, partCount)
 	for i := 0; i < partCount; i++ {
 		res := <-results
@@ -341,7 +288,7 @@ func (s *S3Backup) retryingUploadPart(ctx context.Context, part string, data []b
 	return uploadPartWithBackoff(ctx, part, data, s.log())
 }
 
-// Upload part with exponential backoff and logging
+// Upload part with exponential backoff and logging.
 func uploadPartWithBackoff(ctx context.Context, part string, data []byte, logger interface{ WithField(string, interface{}) interface{ WithError(error) interface{ Warn(string) } } }) (string, error) {
 	client := &http.Client{Timeout: time.Hour * 2}
 	var etag string
@@ -355,7 +302,6 @@ func uploadPartWithBackoff(ctx context.Context, part string, data []byte, logger
 		r.Header.Add("Content-Type", "application/x-gzip")
 		res, err := client.Do(r)
 		if err != nil {
-			// Connection or timeout errors
 			return errors.Wrap(err, "backup: S3 HTTP request failed")
 		}
 		_ = res.Body.Close()
@@ -390,6 +336,7 @@ func bytesReader(b []byte) io.Reader {
 type byteReader struct {
 	b []byte
 }
+
 func (r *byteReader) Read(p []byte) (int, error) {
 	if len(r.b) == 0 {
 		return 0, io.EOF
