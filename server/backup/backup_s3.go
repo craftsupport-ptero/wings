@@ -1,31 +1,44 @@
 package backup
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"emperror.dev/errors"
 	"github.com/cenkalti/backoff/v4"
 	"github.com/juju/ratelimit"
-	"github.com/mholt/archiver/v4"
+	"github.com/mholt/archives"
 
 	"github.com/pterodactyl/wings/config"
 	"github.com/pterodactyl/wings/remote"
 	"github.com/pterodactyl/wings/server/filesystem"
 )
 
-// S3Backup implements a backup stored in S3.
 type S3Backup struct {
 	Backup
 }
 
 var _ BackupInterface = (*S3Backup)(nil)
+
+// ------------ CONFIGURATION -------------
+// Set these via config or directly as needed.
+var (
+	DefaultTarThreads    = 6 // Set via config if desired
+	DefaultUploadThreads = 64 // Set via config if desired
+	SpeedLogInterval     = 5 * time.Second // Log upload speed every 5 seconds
+)
+
+// ------------ END CONFIGURATION ----------
 
 func NewS3(client remote.Client, uuid string, ignore string) *S3Backup {
 	return &S3Backup{
@@ -38,39 +51,140 @@ func NewS3(client remote.Client, uuid string, ignore string) *S3Backup {
 	}
 }
 
-// Remove removes a backup from the system.
 func (s *S3Backup) Remove() error {
 	return os.Remove(s.Path())
 }
 
-// WithLogContext attaches additional context to the log output for this backup.
 func (s *S3Backup) WithLogContext(c map[string]interface{}) {
 	s.logContext = c
 }
 
-// Generate creates a new backup on the disk, moves it into the S3 bucket via
-// the provided presigned URL, and then deletes the backup from the disk.
+// Streaming tar.gz archiver with configurable concurrency.
+// Walks the filesystem and writes to w as a tar.gz stream.
+func (s *S3Backup) streamTarGz(ctx context.Context, fsys *filesystem.Filesystem, ignore string, w io.Writer, tarThreads int) error {
+	gz := gzip.NewWriter(w)
+	defer gz.Close()
+	tw := tar.NewWriter(gz)
+	defer tw.Close()
+
+	// Worker pool to copy file data concurrently
+	type fileJob struct {
+		Header *tar.Header
+		Path   string
+	}
+
+	jobs := make(chan fileJob, tarThreads*2)
+	errs := make(chan error, tarThreads)
+	var wg sync.WaitGroup
+
+	for i := 0; i < tarThreads; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				if err := tw.WriteHeader(job.Header); err != nil {
+					errs <- err
+					return
+				}
+				// Only copy file data for regular files
+				if job.Header.Typeflag == tar.TypeReg {
+					f, err := os.Open(job.Path)
+					if err != nil {
+						errs <- err
+						return
+					}
+					_, err = io.Copy(tw, f)
+					f.Close()
+					if err != nil {
+						errs <- err
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	sendErr := func(err error) bool {
+		select {
+		case errs <- err:
+			return true
+		default:
+			return false
+		}
+	}
+
+	walkErr := fsys.WalkFiles(ctx, func(path string, info os.FileInfo, _ error) error {
+		relPath, err := filepath.Rel(fsys.BasePath(), path)
+		if err != nil {
+			return err
+		}
+		// Ignore files as per configured ignore rules
+		if filesystem.ShouldIgnore(relPath, ignore) {
+			return nil
+		}
+		hdr, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return err
+		}
+		hdr.Name = relPath
+		select {
+		case jobs <- fileJob{Header: hdr, Path: path}:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	close(jobs)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return walkErr
+}
+
 func (s *S3Backup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ignore string) (*ArchiveDetails, error) {
 	defer s.Remove()
 
-	a := &filesystem.Archive{
-		Filesystem: fsys,
-		Ignore:     ignore,
-	}
+	s.log().WithField("path", s.Path()).Info("starting streaming backup for server")
 
-	s.log().WithField("path", s.Path()).Info("creating backup for server")
-	if err := a.Create(ctx, s.Path()); err != nil {
+	// Estimate size for S3 part planning (optional, can be 0 if unknown)
+	size, err := fsys.EstimateArchiveSize(ctx, ignore)
+	if err != nil {
 		return nil, err
 	}
-	s.log().Info("created backup successfully")
 
-	rc, err := os.Open(s.Path())
-	if err != nil {
-		return nil, errors.Wrap(err, "backup: could not read archive from disk")
+	// Use config or default for threads
+	tarThreads := config.Get().System.Backups.TarThreads
+	if tarThreads <= 0 {
+		tarThreads = DefaultTarThreads
 	}
-	defer rc.Close()
+	uploadThreads := config.Get().System.Backups.UploadThreads
+	if uploadThreads <= 0 {
+		uploadThreads = DefaultUploadThreads
+	}
 
-	parts, err := s.generateRemoteRequest(ctx, rc)
+	pr, pw := io.Pipe()
+	go func() {
+		defer pw.Close()
+		s.log().Info("tar.gz archiving started")
+		err := s.streamTarGz(ctx, fsys, ignore, pw, tarThreads)
+		if err != nil {
+			s.log().WithError(err).Error("failed to stream archive to pipe")
+			pw.CloseWithError(err)
+		}
+		s.log().Info("tar.gz archiving finished")
+	}()
+
+	urls, err := s.client.GetBackupRemoteUploadURLs(ctx, s.Uuid, size)
+	if err != nil {
+		return nil, err
+	}
+	s.log().WithField("parts", len(urls.Parts)).Info("got S3 upload urls from the Panel")
+
+	parts, err := s.optimizedStreamToS3WithRetry(ctx, pr, size, urls, uploadThreads)
 	if err != nil {
 		return nil, err
 	}
@@ -81,191 +195,184 @@ func (s *S3Backup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ig
 	return ad, nil
 }
 
-// Restore will read from the provided reader assuming that it is a gzipped
-// tar reader. When a file is encountered in the archive the callback function
-// will be triggered. If the callback returns an error the entire process is
-// stopped, otherwise this function will run until all files have been written.
-//
-// This restoration uses a workerpool to use up to the number of CPUs available
-// on the machine when writing files to the disk.
-func (s *S3Backup) Restore(ctx context.Context, r io.Reader, callback RestoreCallback) error {
-	reader := r
-	// Steal the logic we use for making backups which will be applied when restoring
-	// this specific backup. This allows us to prevent overloading the disk unintentionally.
-	if writeLimit := int64(config.Get().System.Backups.WriteLimit * 1024 * 1024); writeLimit > 0 {
-		reader = ratelimit.Reader(r, ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit))
+// Optimized version: concurrent multipart uploads, upload speed logging
+func (s *S3Backup) optimizedStreamToS3WithRetry(ctx context.Context, pr io.Reader, size int64, urls *remote.BackupRemoteUploadURLs, uploadThreads int) ([]remote.BackupPart, error) {
+	type uploadTask struct {
+		Index int
+		Part  string
+		Size  int64
+		Data  []byte
 	}
-	if err := format.Extract(ctx, reader, nil, func(ctx context.Context, f archiver.File) error {
-		r, err := f.Open()
-		if err != nil {
-			return err
+	type uploadResult struct {
+		Index int
+		ETag  string
+		Err   error
+	}
+
+	// Split into parts and buffer them in memory
+	s.log().Info("splitting archive into parts for multipart upload")
+	partCount := len(urls.Parts)
+	partSize := urls.PartSize
+	partsData := make([][]byte, partCount)
+	var totalRead int64
+
+	for i := 0; i < partCount; i++ {
+		thisPartSize := partSize
+		if i+1 == partCount {
+			thisPartSize = size - int64(i)*partSize
 		}
-		defer r.Close()
-		return callback(f.NameInArchive, f.FileInfo, r)
-	}); err != nil {
-		return err
-	}
-	return nil
-}
-
-// Generates the remote S3 request and begins the upload.
-// This version is parallel, memory-safe, and retries parts endlessly (unless context is canceled).
-func (s *S3Backup) generateRemoteRequest(ctx context.Context, rc io.ReadCloser) ([]remote.BackupPart, error) {
-	defer rc.Close()
-
-	s.log().Debug("attempting to get size of backup...")
-	size, err := s.Backup.Size()
-	if err != nil {
-		return nil, err
-	}
-	s.log().WithField("size", size).Debug("got size of backup")
-
-	s.log().Debug("attempting to get S3 upload urls from Panel...")
-	urls, err := s.client.GetBackupRemoteUploadURLs(context.Background(), s.Backup.Uuid, size)
-	if err != nil {
-		return nil, err
-	}
-	s.log().Debug("got S3 upload urls from the Panel")
-	s.log().WithField("parts", len(urls.Parts)).Info("attempting to upload backup to s3 endpoint...")
-
-	// Open the file for random access
-	f, err := os.Open(s.Path())
-	if err != nil {
-		return nil, errors.Wrap(err, "backup: could not open archive from disk")
-	}
-	defer f.Close()
-
-	type partResult struct {
-		idx  int
-		etag string
-		err  error
+		buf := make([]byte, thisPartSize)
+		n, err := io.ReadFull(pr, buf)
+		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+			return nil, err
+		}
+		partsData[i] = buf[:n]
+		atomic.AddInt64(&totalRead, int64(n))
+		if n < int(thisPartSize) {
+			break // EOF
+		}
 	}
 
-	uploader := newS3FileUploader(nil)
-	numParts := len(urls.Parts)
-	uploadedParts := make([]remote.BackupPart, numParts)
-	results := make(chan partResult, numParts)
+	s.log().WithField("read", totalRead).Info("finished buffering all parts, beginning upload")
 
-	// Limit number of concurrent uploads
-	const maxParallel = 4
-	sem := make(chan struct{}, maxParallel)
-	var wg sync.WaitGroup
+	// Upload with concurrent workers
+	tasks := make(chan uploadTask, partCount)
+	results := make(chan uploadResult, partCount)
+	var uploadedBytes int64
 
-	for i, partURL := range urls.Parts {
-		wg.Add(1)
-		sem <- struct{}{} // Acquire a slot
-
-		go func(idx int, partURL string) {
-			defer wg.Done()
-			defer func() { <-sem }() // Release slot
-
-			offset := int64(idx) * urls.PartSize
-			var partSize int64
-			if idx+1 < numParts {
-				partSize = urls.PartSize
-			} else {
-				partSize = size - (int64(idx) * urls.PartSize)
-			}
-
-			var etag string
-			uploadFn := func() error {
-				section := io.NewSectionReader(f, offset, partSize)
-				reader := io.NopCloser(section)
-				defer reader.Close()
-				var err error
-				etag, err = uploader.uploadPart(ctx, partURL, partSize, reader)
-				if err != nil {
-					s.log().WithField("part_id", idx+1).WithError(err).Warn("failed to upload part, will retry")
-				}
-				return err
-			}
-
-			b := backoff.NewExponentialBackOff()
-			b.MaxElapsedTime = 0 // never give up
-			err := backoff.RetryNotify(uploadFn, backoff.WithContext(b, ctx),
-				func(err error, d time.Duration) {
-					s.log().WithField("part_id", idx+1).WithError(err).
-						Warnf("retrying backup part after error (delay %s)", d)
-				})
-
-			if err == nil {
-				s.log().WithField("part_id", idx+1).Info("successfully uploaded backup part")
-			}
-
-			results <- partResult{idx: idx, etag: etag, err: err}
-		}(i, partURL)
+	// Upload worker goroutine
+	uploadWorker := func() {
+		for task := range tasks {
+			s.log().WithField("part_id", task.Index+1).WithField("size", task.Size).Info("uploading backup part")
+			etag, err := s.retryingUploadPart(ctx, task.Part, task.Data)
+			atomic.AddInt64(&uploadedBytes, int64(len(task.Data)))
+			results <- uploadResult{Index: task.Index, ETag: etag, Err: err}
+		}
 	}
 
+	// Start upload workers
+	for i := 0; i < uploadThreads; i++ {
+		go uploadWorker()
+	}
+
+	// Speed logger
+	done := make(chan struct{})
 	go func() {
-		wg.Wait()
-		close(results)
+		ticker := time.NewTicker(SpeedLogInterval)
+		defer ticker.Stop()
+		start := time.Now()
+		var lastBytes int64
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				curBytes := atomic.LoadInt64(&uploadedBytes)
+				elapsed := time.Since(start).Seconds()
+				avgSpeed := float64(curBytes) / elapsed
+				intervalSpeed := float64(curBytes-lastBytes) / SpeedLogInterval.Seconds()
+				s.log().WithFields(map[string]interface{}{
+					"uploaded":      curBytes,
+					"average_speed": fmt.Sprintf("%.2f MB/s", avgSpeed/1024/1024),
+					"interval_speed": fmt.Sprintf("%.2f MB/s", intervalSpeed/1024/1024),
+				}).Info("upload speed stats")
+				lastBytes = curBytes
+			}
+		}
 	}()
 
-	for res := range results {
-		if res.err != nil {
-			// Only possible if context canceled, otherwise retries forever
-			return nil, fmt.Errorf("upload failed for part %d: %w", res.idx+1, res.err)
-		}
-		uploadedParts[res.idx] = remote.BackupPart{
-			ETag:       res.etag,
-			PartNumber: res.idx + 1,
+	// Feed tasks
+	for i := 0; i < partCount; i++ {
+		thisPartSize := int64(len(partsData[i]))
+		tasks <- uploadTask{
+			Index: i,
+			Part:  urls.Parts[i],
+			Size:  thisPartSize,
+			Data:  partsData[i],
 		}
 	}
+	close(tasks)
 
-	s.log().WithField("parts", numParts).Info("backup has been successfully uploaded")
+	// Collect results
+	uploadedParts := make([]remote.BackupPart, partCount)
+	for i := 0; i < partCount; i++ {
+		res := <-results
+		if res.Err != nil {
+			close(done)
+			return nil, res.Err
+		}
+		uploadedParts[res.Index] = remote.BackupPart{
+			ETag:       res.ETag,
+			PartNumber: res.Index + 1,
+		}
+		s.log().WithField("part_id", res.Index+1).Info("successfully uploaded backup part")
+	}
+	close(done)
+	s.log().WithField("parts", partCount).Info("backup has been successfully uploaded")
 	return uploadedParts, nil
 }
 
-type s3FileUploader struct {
-	client *http.Client
+// Keeps retry/backoff logic
+func (s *S3Backup) retryingUploadPart(ctx context.Context, part string, data []byte) (string, error) {
+	return uploadPartWithBackoff(ctx, part, data, s.log())
 }
 
-// newS3FileUploader returns a new file uploader instance.
-func newS3FileUploader(_ io.Reader) *s3FileUploader {
-	return &s3FileUploader{
-		client: &http.Client{Timeout: time.Hour * 2},
-	}
-}
-
-// Accepts a reader for the part; used by each goroutine
-func (fu *s3FileUploader) uploadPart(ctx context.Context, part string, size int64, reader io.ReadCloser) (string, error) {
-	r, err := http.NewRequestWithContext(ctx, http.MethodPut, part, reader)
-	if err != nil {
-		return "", errors.Wrap(err, "backup: could not create request for S3")
-	}
-	r.ContentLength = size
-	r.Header.Add("Content-Length", strconv.Itoa(int(size)))
-	r.Header.Add("Content-Type", "application/x-gzip")
-
-	res, err := fu.client.Do(r)
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			return "", backoff.Permanent(err)
+// Upload part with exponential backoff and logging
+func uploadPartWithBackoff(ctx context.Context, part string, data []byte, logger interface{ WithField(string, interface{}) interface{ WithError(error) interface{ Warn(string) } } }) (string, error) {
+	client := &http.Client{Timeout: time.Hour * 2}
+	var etag string
+	err := backoff.Retry(func() error {
+		r, err := http.NewRequestWithContext(ctx, http.MethodPut, part, io.NopCloser(bytesReader(data)))
+		if err != nil {
+			return errors.Wrap(err, "backup: could not create request for S3")
 		}
-		return "", errors.Wrap(err, "backup: S3 HTTP request failed")
-	}
-	defer res.Body.Close()
-
-	if res.StatusCode != http.StatusOK {
-		err := errors.New(fmt.Sprintf("backup: failed to put S3 object: [HTTP/%d] %s", res.StatusCode, res.Status))
-		if res.StatusCode >= http.StatusInternalServerError {
-			// Retryable
-			return "", err
+		r.ContentLength = int64(len(data))
+		r.Header.Add("Content-Length", strconv.Itoa(len(data)))
+		r.Header.Add("Content-Type", "application/x-gzip")
+		res, err := client.Do(r)
+		if err != nil {
+			// Connection or timeout errors
+			return errors.Wrap(err, "backup: S3 HTTP request failed")
 		}
-		// Non-retryable
-		return "", backoff.Permanent(err)
+		_ = res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			err := errors.New(fmt.Sprintf("backup: failed to put S3 object: [HTTP/%d] %s", res.StatusCode, res.Status))
+			if res.StatusCode >= http.StatusInternalServerError {
+				return err
+			}
+			return backoff.Permanent(err)
+		}
+		etag = res.Header.Get("ETag")
+		return nil
+	}, backoff.WithContext(newBackoff(), ctx))
+	if err != nil {
+		return "", err
 	}
-
-	etag := res.Header.Get("ETag")
 	return etag, nil
 }
 
-// Reader provides a wrapper around an existing io.Reader
-// but implements io.Closer in order to satisfy an io.ReadCloser.
-type Reader struct {
-	io.Reader
+func newBackoff() backoff.BackOff {
+	b := backoff.NewExponentialBackOff()
+	b.Multiplier = 2
+	b.MaxElapsedTime = time.Minute
+	return b
 }
 
-func (Reader) Close() error {
-	return nil
+// bytesReader returns an io.Reader for a []byte without extra allocations
+func bytesReader(b []byte) io.Reader {
+	return &byteReader{b: b}
 }
+
+type byteReader struct {
+	b []byte
+}
+func (r *byteReader) Read(p []byte) (int, error) {
+	if len(r.b) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.b)
+	r.b = r.b[n:]
+	return n, nil
+}
+
+func (r *byteReader) Close() error { return nil }
