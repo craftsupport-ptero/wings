@@ -18,7 +18,7 @@ import (
 	"github.com/cenkalti/backoff/v4"
 	"github.com/juju/ratelimit"
 	"github.com/mholt/archives"
-
+        "github.com/mholt/archiver/v4"
 	"github.com/pterodactyl/wings/config"
 	"github.com/pterodactyl/wings/remote"
 	"github.com/pterodactyl/wings/server/filesystem"
