@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"time"
 
@@ -102,7 +101,7 @@ func (s *S3Backup) Restore(ctx context.Context, r io.Reader, callback RestoreCal
 			return err
 		}
 		defer fileReader.Close()
-		return callback(f.Name(), f.FileInfo(), fileReader)
+		return callback(f.Name(), f.FileInfo, fileReader)
 	}); err != nil {
 		s.log().WithError(err).Error("restore failed during extraction")
 		return err
