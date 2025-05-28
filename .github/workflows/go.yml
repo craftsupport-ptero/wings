@@ -19,7 +19,8 @@ jobs:
       uses: actions/setup-go@v4
       with:
         go-version: '1.22' # This version supports 'slices' and 'cmp'
-
+    - name: fack
+      run: go get github.com/mholt/archives
     - name: Build application
       # This command builds your application and outputs a binary named 'your-app-name'.
       # - If your main package (where main.go is) is in the root directory, use '.'
@@ -32,7 +33,6 @@ jobs:
 
     - name: Test
       run: go test -v ./...
-
     - name: Upload application binary
       uses: actions/upload-artifact@v4
       with:
