@@ -36,8 +36,6 @@ jobs:
     - name: Upload application binary
       uses: actions/upload-artifact@v4
       with:
-        # Name of the artifact as it will appear in GitHub.
-        # You can customize this, e.g., include OS or arch if you build for multiple.
         name: wings-linux-amd64
         # Path to the binary file you want to upload.
         # This must match the output file name from the 'go build' command.
