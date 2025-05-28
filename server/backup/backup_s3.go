@@ -14,16 +14,39 @@ import (
     "github.com/cenkalti/backoff/v4"
     "github.com/pterodactyl/wings/remote"
 )
+
+// --- S3Backup struct & constructor ---
+
+type S3Backup struct {
+    Backup
+}
+
+var _ BackupInterface = (*S3Backup)(nil)
+
+func NewS3(client remote.Client, uuid string, ignore string) *S3Backup {
+    return &S3Backup{
+        Backup{
+            client:  client,
+            Uuid:    uuid,
+            Ignore:  ignore,
+            adapter: S3BackupAdapter,
+        },
+    }
+}
+
+// --- Parallelized, robust multipart upload logic ---
+
 type s3FileUploader struct {
     client *http.Client
 }
 
 func newS3FileUploader(_ io.Reader) *s3FileUploader {
-    // If you want, you can accept an io.Reader here, but it isn't used in parallel uploads.
     return &s3FileUploader{
         client: &http.Client{Timeout: 2 * time.Hour},
     }
 }
+
+// The main logic: parallel, memory-efficient, endless retry per part
 func (s *S3Backup) generateRemoteRequest(ctx context.Context, rc io.ReadCloser) ([]remote.BackupPart, error) {
     defer rc.Close()
 
@@ -55,7 +78,7 @@ func (s *S3Backup) generateRemoteRequest(ctx context.Context, rc io.ReadCloser) 
         err  error
     }
 
-    uploader := newS3FileUploader(f) // will only use the http.Client
+    uploader := newS3FileUploader(f) // only uses HTTP client
 
     numParts := len(urls.Parts)
     uploadedParts := make([]remote.BackupPart, numParts)
@@ -84,20 +107,17 @@ func (s *S3Backup) generateRemoteRequest(ctx context.Context, rc io.ReadCloser) 
 
             var etag string
             uploadFn := func() error {
-                // Open a new SectionReader for this attempt
                 section := io.NewSectionReader(f, offset, partSize)
                 reader := io.NopCloser(section)
                 defer reader.Close()
                 var err error
                 etag, err = uploader.uploadPart(ctx, partURL, partSize, reader)
                 if err != nil {
-                    // Log each failed attempt
                     s.log().WithField("part_id", idx+1).WithError(err).Warn("failed to upload part, will retry")
                 }
                 return err
             }
 
-            // Retry indefinitely unless context is canceled
             b := backoff.NewExponentialBackOff()
             b.MaxElapsedTime = 0 // never give up
             err := backoff.RetryNotify(uploadFn, backoff.WithContext(b, ctx),
@@ -114,13 +134,11 @@ func (s *S3Backup) generateRemoteRequest(ctx context.Context, rc io.ReadCloser) 
         }(i, partURL)
     }
 
-    // Wait for all uploads to finish and close results channel
     go func() {
         wg.Wait()
         close(results)
     }()
 
-    // Collect results
     for res := range results {
         if res.err != nil {
             // Only possible if context canceled, otherwise retries forever
@@ -136,7 +154,7 @@ func (s *S3Backup) generateRemoteRequest(ctx context.Context, rc io.ReadCloser) 
     return uploadedParts, nil
 }
 
-// Modified uploadPart: accepts a reader for the part
+// Accepts a reader for the part; used by each goroutine
 func (fu *s3FileUploader) uploadPart(ctx context.Context, part string, size int64, reader io.ReadCloser) (string, error) {
     r, err := http.NewRequestWithContext(ctx, http.MethodPut, part, reader)
     if err != nil {
