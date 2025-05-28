@@ -34,6 +34,36 @@ func NewS3(client remote.Client, uuid string, ignore string) *S3Backup {
     }
 }
 
+func (s *S3Backup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ignore string) (*ArchiveDetails, error) {
+    defer s.Remove()
+
+    a := &filesystem.Archive{
+        Filesystem: fsys,
+        Ignore:     ignore,
+    }
+
+    s.log().WithField("path", s.Path()).Info("creating backup for server")
+    if err := a.Create(ctx, s.Path()); err != nil {
+        return nil, err
+    }
+    s.log().Info("created backup successfully")
+
+    rc, err := os.Open(s.Path())
+    if err != nil {
+        return nil, errors.Wrap(err, "backup: could not read archive from disk")
+    }
+    defer rc.Close()
+
+    parts, err := s.generateRemoteRequest(ctx, rc)
+    if err != nil {
+        return nil, err
+    }
+    ad, err := s.Details(ctx, parts)
+    if err != nil {
+        return nil, errors.WrapIf(err, "backup: failed to get archive details after upload")
+    }
+    return ad, nil
+}
 // --- Parallelized, robust multipart upload logic ---
 
 type s3FileUploader struct {
